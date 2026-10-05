@@ -41,6 +41,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1257,6 +1258,180 @@ class StrataEngine:
                 self.proc = None
                 self.ended = True
                 self.progress, self.last = None, {}
+
+
+class LlamaCppEngine:
+    """llama.cpp's `llama-server` as the engine: the Apple Silicon (Metal) path, set up by setup-mac.sh.  It runs as a
+    child on a free loopback port and is never exposed; this server keeps the tokenizer, the chat template, the APIs
+    and the web app, and sends llama-server token ids (`/completion` with "return_tokens"), so both sides agree on
+    every id.  "cache_prompt" keeps llama.cpp's prefix reuse: a follow-up turn reads only what is new.  Not here:
+    images, batch slots, the VRAM reserve - the Service skips what an engine does not have."""
+
+    START_TIMEOUT_S = 600.0                              # loading a ~40 GB model from a cold disk
+    FINISH = {"eos": "stop", "word": "stop", "limit": "length"}
+
+    def __init__(self, exe: str, model: str, max_context: int, args: list[str] | None = None,
+                 log: str | None = None, env: dict | None = None):
+        self.spawn = (exe, model, int(max_context), list(args or []), log, env)
+        self.max_context, self.log_path = int(max_context), log
+        self.info = {"version": "llama.cpp"}
+        self.last, self.progress, self.proc, self.log = {}, None, None, None
+        self.unloaded = True
+        self._start()
+
+    def _start(self):
+        exe, model, ctx, args, log, env = self.spawn
+        with socket.socket() as s:                       # ponytail: a free port can be taken again before
+            s.bind(("127.0.0.1", 0))                     # llama-server binds it; the start then fails and says so
+            port = s.getsockname()[1]
+        self.url = f"http://127.0.0.1:{port}"
+        self.log = open(log, "a", encoding="utf-8") if log else subprocess.DEVNULL
+        self.proc = subprocess.Popen([exe, "-m", model, "-c", str(ctx), "-np", "1", "-ngl", "99", "-fa", "on",
+                                      "--host", "127.0.0.1", "--port", str(port), "--no-webui", *args],
+                                     stdin=subprocess.DEVNULL, stdout=self.log, stderr=subprocess.STDOUT, env=env)
+        contain(self.proc)
+        deadline = time.monotonic() + self.START_TIMEOUT_S
+        while True:
+            if self.proc.poll() is not None:
+                raise RuntimeError(f"llama-server exited while loading the model (code {self.proc.returncode}); "
+                                   f"its log: {log or '(none)'}")
+            try:
+                with urllib.request.urlopen(self.url + "/health", timeout=5) as r:
+                    if r.status == 200:
+                        break
+            except OSError:                              # not listening yet, or 503 while it loads
+                pass
+            if time.monotonic() > deadline:
+                self.close()
+                raise RuntimeError(f"llama-server did not load the model within {self.START_TIMEOUT_S:.0f} s")
+            time.sleep(0.5)
+        self.unloaded = False
+
+    def alive(self) -> bool:
+        return self.proc is not None and self.proc.poll() is None
+
+    def exit_code(self):
+        return None if self.proc is None else self.proc.poll()
+
+    def death_note(self) -> str:
+        return (f"llama-server stopped (exit code {self.exit_code()}). Its log ({self.log_path or 'none'}) says why; "
+                "the usual cause is memory: close other programs, or lower max_context in the config.")
+
+    def unload(self):
+        self.close()
+        self.unloaded = True
+
+    def restart(self):
+        self.close()
+        self._start()
+
+    def close(self):
+        if self.proc is not None:
+            if self.proc.poll() is None:
+                self.proc.terminate()
+                try:
+                    self.proc.wait(timeout=20)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+                    self.proc.wait(timeout=20)
+            self.proc = None
+        if self.log not in (None, subprocess.DEVNULL):
+            self.log.close()
+        self.log, self.progress = None, None
+
+    @staticmethod
+    def sampling_body(sampling: dict) -> dict:
+        """The request's sampling in llama-server's names.  No temperature means greedy, as with `strata --serve`."""
+        t = sampling.get("temperature")
+        out = {"temperature": float(t) if isinstance(t, (int, float)) and float(t) > 0 else 0.0}
+        for ours, theirs in (("top_p", "top_p"), ("top_k", "top_k"), ("min_p", "min_p"), ("seed", "seed"),
+                             ("repetition_penalty", "repeat_penalty"), ("frequency_penalty", "frequency_penalty"),
+                             ("presence_penalty", "presence_penalty"), ("penalty_last_n", "repeat_last_n")):
+            v = sampling.get(ours)
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                out[theirs] = v
+        return out
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        """Yields token ids, and None every 10 s while llama-server is quiet (reading a long prompt).  A consumer
+        that stops early, or `cancel`, closes the connection, which makes llama-server stop."""
+        if embeddings:
+            raise ValueError("this engine (llama.cpp) has no image encoder: send text only")
+        body = {"prompt": [int(t) for t in ids], "n_predict": int(max_new), "stream": True, "return_tokens": True,
+                "cache_prompt": True, **self.sampling_body(sampling or {})}
+        self.progress = None
+        try:
+            resp = urllib.request.urlopen(urllib.request.Request(
+                self.url + "/completion", json.dumps(body).encode(), {"Content-Type": "application/json"}))
+        except urllib.error.HTTPError as e:              # llama-server refused the request (its message says why)
+            raise ValueError(f"llama-server: {e.read().decode('utf-8', 'replace')[:500]}") from None
+        except OSError:
+            raise EngineDied(f"llama-server stopped unexpectedly (exit code {self.exit_code()})") from None
+        lines: queue.Queue = queue.Queue()
+
+        def pump():                                      # reads on its own thread, so quiet stretches can yield
+            try:
+                for line in resp:
+                    lines.put(line)
+            except (OSError, ValueError, AttributeError):   # AttributeError: http.client, closed under the read
+                pass
+            lines.put(None)
+
+        threading.Thread(target=pump, daemon=True).start()
+        done = False
+
+        def chunk(line):
+            nonlocal done
+            line = line.strip()
+            if not line.startswith(b"data: "):
+                return None
+            c = json.loads(line[6:])
+            if c.get("stop"):
+                t = c.get("timings") or {}
+                self.last = {"generated": int(t.get("predicted_n", 0)), "prompt_tokens": len(ids),
+                             "prompt_ms": float(t.get("prompt_ms", 0.0)), "decode_ms": float(t.get("predicted_ms", 0.0)),
+                             "finish": self.FINISH.get(c.get("stop_type"), "stop"), "reused": int(t.get("cache_n", 0))}
+                done = True
+            if "error" in c:
+                done = True
+                raise ValueError(f"llama-server: {c['error']}")
+            return c.get("tokens") or []
+
+        try:
+            while not done:
+                try:
+                    line = lines.get(timeout=10.0)
+                except queue.Empty:
+                    if cancel.is_set():
+                        return
+                    yield None
+                    continue
+                if line is None:
+                    raise EngineDied(f"llama-server stopped unexpectedly (exit code {self.exit_code()})")
+                for t in chunk(line) or []:
+                    if cancel.is_set():
+                        return
+                    yield int(t)
+        finally:
+            if not done and not cancel.is_set():
+                # the consumer stopped at the end-of-turn token: the final chunk (timings) follows right behind it
+                try:
+                    while not done:
+                        line = lines.get(timeout=0.5)
+                        if line is None:
+                            break
+                        chunk(line)
+                except (queue.Empty, ValueError):
+                    pass
+            resp.close()
+
+
+def llamacpp_engine_from_config(cfg: dict, env: dict | None = None) -> LlamaCppEngine:
+    """The config's `"engine": "llamacpp"` entry (setup-mac.sh writes it); relative paths are the config's cwd's."""
+    cwd = cfg.get("cwd") or "."
+    path = lambda p: p if os.path.isabs(p) else os.path.abspath(os.path.join(cwd, p))   # noqa: E731
+    return LlamaCppEngine(path(cfg["exe"]), path(cfg["model"]), int(cfg.get("max_context") or 32768),
+                          args=list(cfg.get("args") or []), log=cfg.get("log"), env=env)
 
 
 class Vision:
@@ -3897,7 +4072,7 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
+    ap.add_argument("--engine", choices=["mock", "strata", "llamacpp"], default="mock")
     ap.add_argument("--config", help="strata engine config (JSON: exe, args, cwd, tokenizer, model_name), "
                                      "written by setup.py")
     ap.add_argument("--host", default=None,
@@ -3947,7 +4122,7 @@ def main() -> int:
         a.tokenizer = cfg["tokenizer"]
     tok = ByteTokenizer()
     tpath = Path(a.tokenizer)
-    if a.engine == "strata" and not (tpath / "vocab.json").exists():
+    if a.engine in ("strata", "llamacpp") and not (tpath / "vocab.json").exists():
         ap.error(f"the model's tokenizer is missing ({tpath / 'vocab.json'}); run setup again")
     if (tpath / "vocab.json").exists():
         import strata_tokenizer as ST
@@ -4006,6 +4181,12 @@ def main() -> int:
                                  linux_desktop())
         if note:                                        # #560 #516: before --open starts a browser on that card
             print(note, flush=True)
+    elif a.engine == "llamacpp":                        # Apple Silicon: llama.cpp's Metal engine (setup-mac.sh)
+        if not cfg:
+            ap.error("--engine llamacpp needs --config")
+        effort_end, vision, sampling_defaults = None, None, sampling_defaults_from_config(cfg)
+        print("loading the model (llama.cpp) ...", flush=True)
+        engine = llamacpp_engine_from_config(cfg, env=child_env(cfg))
     else:
         effort_end = None
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [

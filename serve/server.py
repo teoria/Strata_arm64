@@ -33,6 +33,7 @@ import os
 import queue
 import re
 import select
+import shutil
 import signal
 import socket
 import struct
@@ -1299,7 +1300,9 @@ class LlamaCppEngine:
         self.log = open(log, "a", encoding="utf-8") if log else subprocess.DEVNULL
         self.proc = subprocess.Popen([exe, "-m", model, "-c", str(ctx), "-np", "1", "-ngl", "99", "-fa", "on",
                                       "--host", "127.0.0.1", "--port", str(port), "--no-webui", *args],
-                                     stdin=subprocess.DEVNULL, stdout=self.log, stderr=subprocess.STDOUT, env=env)
+                                     stdin=subprocess.DEVNULL, stdout=self.log, stderr=subprocess.STDOUT,
+                                     # image_prompt's marker: llama-server's own is random per start
+                                     env={**(env if env is not None else os.environ), "LLAMA_MEDIA_MARKER": self.MEDIA})
         contain(self.proc)
         deadline = time.monotonic() + self.START_TIMEOUT_S
         while True:
@@ -1363,13 +1366,32 @@ class LlamaCppEngine:
                 out[theirs] = v
         return out
 
+    IMAGE = "<|vision_start|><|image_pad|><|vision_end|>"
+    MEDIA = "<__media__>"                                # llama.cpp's mtmd marker; it writes the vision tags itself
+
+    def image_prompt(self, ids, embeddings) -> dict:
+        """A prompt with images (LlamaCppVision): llama-server takes them only beside a text prompt, so the ids are
+        turned back into text by llama-server itself (special tokens included) and each image's tags become the
+        marker.  ponytail: a literal "<|image_pad|>" typed in a message is read as the special token here (#150);
+        an engine that took ids and images together would keep it text."""
+        images = Path(embeddings).read_text().split()
+        try:
+            with urllib.request.urlopen(urllib.request.Request(
+                    self.url + "/detokenize", json.dumps({"tokens": [int(t) for t in ids]}).encode(),
+                    {"Content-Type": "application/json"}), timeout=60) as r:
+                text = json.loads(r.read())["content"]
+        except OSError:
+            raise EngineDied(f"llama-server stopped unexpectedly (exit code {self.exit_code()})") from None
+        if text.count(self.IMAGE) != len(images):
+            raise ValueError("the prompt and its images do not match")
+        return {"prompt_string": text.replace(self.IMAGE, self.MEDIA), "multimodal_data": images}
+
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
         """Yields token ids, and None every 10 s while llama-server is quiet (reading a long prompt).  A consumer
         that stops early, or `cancel`, closes the connection, which makes llama-server stop."""
-        if embeddings:
-            raise ValueError("this engine (llama.cpp) has no image encoder: send text only")
-        body = {"prompt": [int(t) for t in ids], "n_predict": int(max_new), "stream": True, "return_tokens": True,
-                "cache_prompt": True, **self.sampling_body(sampling or {})}
+        body = {"prompt": self.image_prompt(ids, embeddings) if embeddings else [int(t) for t in ids],
+                "n_predict": int(max_new), "stream": True, "return_tokens": True, "cache_prompt": True,
+                **self.sampling_body(sampling or {})}
         self.progress = None
         try:
             resp = urllib.request.urlopen(urllib.request.Request(
@@ -1402,6 +1424,8 @@ class LlamaCppEngine:
                 self.last = {"generated": int(t.get("predicted_n", 0)), "prompt_tokens": len(ids),
                              "prompt_ms": float(t.get("prompt_ms", 0.0)), "decode_ms": float(t.get("predicted_ms", 0.0)),
                              "finish": self.FINISH.get(c.get("stop_type"), "stop"), "reused": int(t.get("cache_n", 0))}
+                if t.get("draft_n") is not None:         # --spec-type: the drafts, as the timings name them
+                    self.last.update(drafts_offered=int(t["draft_n"]), drafts_accepted=int(t.get("draft_n_accepted", 0)))
                 done = True
             if "error" in c:
                 done = True
@@ -1437,12 +1461,37 @@ class LlamaCppEngine:
             resp.close()
 
 
+class LlamaCppVision:
+    """Images for LlamaCppEngine: llama-server reads them itself (--mmproj), so this only checks and normalizes each
+    image (Vision's own load/normalize) and keeps it as one base64 line.  The Service joins a request's image files
+    in prompt order - here one line per image, which is the list llama-server takes.  One "token" per image: the
+    real count is llama-server's, so the context check before a request does not see an image's size."""
+
+    def __init__(self):
+        self.dir = Path(tempfile.mkdtemp(prefix="strata-llamacpp-images-"))
+
+    def encode(self, source: str) -> tuple[Path, int]:
+        data = Vision.normalize(Vision.load(source))
+        path = self.dir / f"{hashlib.sha256(data).hexdigest()[:32]}.b64"
+        if not path.exists():                            # ponytail: kept until the server stops (a few MB per image)
+            path.write_text(base64.b64encode(data).decode() + "\n")
+        return path, 1
+
+    def alive(self) -> bool:
+        return True
+
+    def close(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+
 def llamacpp_engine_from_config(cfg: dict, env: dict | None = None) -> LlamaCppEngine:
-    """The config's `"engine": "llamacpp"` entry (setup-mac.sh writes it); relative paths are the config's cwd's."""
+    """The config's `"engine": "llamacpp"` entry (setup-mac.sh writes it); relative paths are the config's cwd's.
+    "mmproj" (the model's image encoder) turns images on."""
     cwd = cfg.get("cwd") or "."
     path = lambda p: p if os.path.isabs(p) else os.path.abspath(os.path.join(cwd, p))   # noqa: E731
+    args = list(cfg.get("args") or []) + (["--mmproj", path(cfg["mmproj"])] if cfg.get("mmproj") else [])
     return LlamaCppEngine(path(cfg["exe"]), path(cfg["model"]), int(cfg.get("max_context") or 32768),
-                          args=list(cfg.get("args") or []), log=cfg.get("log"), env=env)
+                          args=args, log=cfg.get("log"), env=env)
 
 
 class Vision:
@@ -4195,7 +4244,8 @@ def main() -> int:
     elif a.engine == "llamacpp":                        # Apple Silicon: llama.cpp's Metal engine (setup-mac.sh)
         if not cfg:
             ap.error("--engine llamacpp needs --config")
-        effort_end, vision, sampling_defaults = None, None, sampling_defaults_from_config(cfg)
+        effort_end, sampling_defaults = None, sampling_defaults_from_config(cfg)
+        vision = LlamaCppVision() if cfg.get("mmproj") else None
         print("loading the model (llama.cpp) ...", flush=True)
         engine = llamacpp_engine_from_config(cfg, env=child_env(cfg))
     else:

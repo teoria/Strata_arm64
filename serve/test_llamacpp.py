@@ -5,6 +5,7 @@ llama-server in serve/llamacpp_fake_server.py (no model, no GPU).
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import stat
@@ -19,7 +20,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import ByteTokenizer, EngineDied, LlamaCppEngine, Service, serve  # noqa: E402
+from serve.server import ByteTokenizer, EngineDied, LlamaCppEngine, LlamaCppVision, Service, serve  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 FAKE = ROOT / "serve" / "llamacpp_fake_server.py"
@@ -57,6 +58,7 @@ class Engine(Base):
                             ("--host", "127.0.0.1"), ("--threads", "4")):
             self.assertEqual(argv[argv.index(flag) + 1], value, flag)
         self.assertIn("--no-webui", argv)
+        self.assertEqual(self.events("media_marker")[0], "<__media__>")   # llama-server's own is random per start
         self.assertEqual(e.max_context, 4096)
         self.assertEqual(e.info["version"], "llama.cpp 0.4.1-dev (3cf0325)")
 
@@ -80,6 +82,12 @@ class Engine(Base):
                 break
         self.assertEqual(e.last["finish"], "stop")
         self.assertEqual(e.last["prompt_ms"], 120.5)
+
+    def test_draft_counts_are_kept(self):
+        # --spec-type ngram-simple: llama-server's draft_n / draft_n_accepted become the timings' draft fields
+        e = self.engine(FAKE_DRAFTS="1")
+        list(e.generate([1] * 8, 100, {}, threading.Event()))
+        self.assertEqual((e.last["drafts_offered"], e.last["drafts_accepted"]), (4, 3))
 
     def test_limit_is_length(self):
         e = self.engine(FAKE_TOKENS="5,6,7,8")
@@ -130,10 +138,25 @@ class Engine(Base):
         self.assertTrue(e.alive())
         self.assertFalse(e.unloaded)
 
-    def test_images_are_refused(self):
-        e = self.engine()
+    def test_images_go_as_prompt_string_and_base64(self):
+        # Service joins each image's file into one: one base64 line per image, in prompt order
+        tok, e = ByteTokenizer(), self.engine()
+        ids = tok.encode("<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>What is it?<|im_end|>\n"
+                         "<|vision_start|><|image_pad|><|vision_end|>", parse_special=True)
+        emb = self.dir / "req.sve"
+        emb.write_text("QUFB\nQkJC\n")
+        self.assertEqual(list(e.generate(ids, 10, {}, threading.Event(), embeddings=str(emb))), [9419, 1017, 248046])
+        body = self.events("body")[0]
+        self.assertEqual(body["prompt"], {"prompt_string": "<|im_start|>user\n<__media__>What is it?<|im_end|>\n"
+                                                           "<__media__>", "multimodal_data": ["QUFB", "QkJC"]})
+
+    def test_images_and_markers_must_match(self):
+        tok, e = ByteTokenizer(), self.engine()
+        emb = self.dir / "req.sve"
+        emb.write_text("QUFB\nQkJC\n")
+        ids = tok.encode("<|vision_start|><|image_pad|><|vision_end|>hi", parse_special=True)
         with self.assertRaises(ValueError):
-            list(e.generate([1] * 8, 10, {}, threading.Event(), embeddings="x.bin"))
+            list(e.generate(ids, 10, {}, threading.Event(), embeddings=str(emb)))
 
 
 class OverHttp(Base):
@@ -158,6 +181,45 @@ class OverHttp(Base):
         self.assertEqual(b["timings"]["cache_n"], 6)
 
 
+PNG = base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==")
+
+
+class Images(Base):
+    def test_vision_keeps_the_image_as_one_base64_line(self):
+        v = LlamaCppVision()
+        path, n = v.encode("data:image/png;base64," + base64.b64encode(PNG).decode())
+        self.assertEqual(n, 1)                           # llama-server counts the image's tokens itself
+        self.assertEqual(Path(path).read_text(), base64.b64encode(PNG).decode() + "\n")
+        self.assertEqual(v.encode("data:image/png;base64," + base64.b64encode(PNG).decode())[0], path)
+        self.assertTrue(v.alive())
+        v.close()
+
+    def test_chat_with_an_image_through_the_service(self):
+        tok = ByteTokenizer()
+        ids = tok.encode("</think>\n\nA dot") + tok.encode("<|im_end|>", parse_special=True)
+        e = self.engine(FAKE_TOKENS=",".join(map(str, ids)))
+        svc = Service(e, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"), vision=LlamaCppVision())
+        httpd = serve(svc, port=0)
+        url = "data:image/png;base64," + base64.b64encode(PNG).decode()
+        msg = {"role": "user", "content": [{"type": "text", "text": "What is it?"},
+                                           {"type": "image_url", "image_url": {"url": url}}]}
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/v1/chat/completions",
+                                         data=json.dumps({"model": "m", "messages": [msg]}).encode(),
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                b = json.loads(r.read())
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            svc.vision.close()
+        self.assertEqual(b["choices"][0]["message"]["content"], "A dot")
+        prompt = self.events("body")[0]["prompt"]
+        self.assertEqual(prompt["multimodal_data"], [base64.b64encode(PNG).decode()])
+        self.assertEqual(prompt["prompt_string"].count("<__media__>"), 1)
+        self.assertNotIn("<|image_pad|>", prompt["prompt_string"])
+
+
 class Config(unittest.TestCase):
     def test_engine_from_config(self):
         from serve.server import llamacpp_engine_from_config
@@ -167,6 +229,13 @@ class Config(unittest.TestCase):
             llamacpp_engine_from_config(cfg, env={"A": "1"})
         cls.assert_called_once_with("/opt/strata/bin/llama-server", "/opt/strata/m.gguf", 8192, args=["--threads", "8"],
                                     log="/tmp/x.log", env={"A": "1"})
+
+    def test_mmproj_is_passed_to_llama_server(self):
+        from serve.server import llamacpp_engine_from_config
+        cfg = {"exe": "s", "model": "m.gguf", "mmproj": "v.gguf", "cwd": "/opt/strata", "args": ["--threads", "8"]}
+        with mock.patch("serve.server.LlamaCppEngine") as cls:
+            llamacpp_engine_from_config(cfg)
+        self.assertEqual(cls.call_args.kwargs["args"], ["--threads", "8", "--mmproj", "/opt/strata/v.gguf"])
 
 
 IOREG = b'''+-o AGXAcceleratorG13X  <class AGXAcceleratorG13X>

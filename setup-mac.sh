@@ -1,7 +1,8 @@
 #!/bin/sh
 # Strata for Apple Silicon Macs: llama.cpp's Metal engine behind Strata's own server (serve/server.py --engine
 # llamacpp), so the web app, the OpenAI/Anthropic APIs and the MCP tools are the same as on Windows and Linux.
-# The first run builds llama.cpp, downloads Qwen3.8-Flash-Next IQ2_XS (68 GB) and starts it; later runs just start it.
+# The first run builds llama.cpp, downloads Qwen3.8-Flash-Next IQ2_XS (68 GB) and its image encoder (0.9 GB) and
+# starts it; later runs just start it.
 # Needs Xcode's command line tools (xcode-select --install), cmake (brew install cmake) and Python 3.10+.
 #
 #   ./setup-mac.sh                 build, download, start on http://127.0.0.1:8080
@@ -13,12 +14,15 @@ cd "$(dirname "$0")"
 
 Q=IQ2_XS
 REPO=ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF
-# the same pins as setup.py (#214): llama.cpp's commit and the model repository's revision
-COMMIT=$(sed -n 's/^LLAMA_CPP_COMMIT = "\([0-9a-f]*\)"/\1/p' setup.py)
+# llama.cpp's commit: newer than setup.py's LLAMA_CPP_COMMIT (which the Windows/Linux builds keep), for Metal's sparse
+# attention - on an M1 Max, IQ2_XS at 32K context: 19.9 tok/s writing, 197 reading, against 14.1 / 150 at setup.py's
+COMMIT=3c9e747f7e8b456d81ee66ae679e943213fb7f7d
+# the model repository's revision: setup.py's pin (#214)
 REV=$(sed -n "s|^ *\"$REPO\": \"\([0-9a-f]*\)\".*|\1|p" setup.py)
 # SHA-256 of the two shards at that revision (Hugging Face's LFS ids)
 SHA1=92cee27ae5bbadcd732416a0f7a7f0acc092399dbbe8f5a5efa707c2ec0a49d7
 SHA2=316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113
+SHA_MMPROJ=b1a82259702816a5330d7bd7607cd9676b11780e79ff7348c21103ff3ce49bd0   # the image encoder (0.9 GB)
 
 # 1. Python 3.10+ in .venv, with the pinned packages
 if [ ! -x .venv/bin/python ]; then
@@ -33,9 +37,9 @@ if [ ! -x .venv/bin/python ]; then
   .venv/bin/python -m pip install -q -r requirements.txt
 fi
 
-# 2. llama.cpp with Metal, at the pinned commit
+# 2. llama.cpp with Metal, at the pinned commit (built again when the pin changes)
 LLAMA=third_party/llama.cpp
-if [ ! -x $LLAMA/build/bin/llama-server ]; then
+if [ ! -x $LLAMA/build/bin/llama-server ] || [ "$(git -C $LLAMA rev-parse HEAD 2>/dev/null)" != "$COMMIT" ]; then
   command -v cmake >/dev/null 2>&1 || { echo "cmake is needed: brew install cmake"; exit 1; }
   if [ ! -d $LLAMA/.git ]; then
     git init -q $LLAMA
@@ -50,18 +54,20 @@ fi
 # 3. the model, resumable, checked once (68 GB takes a minute or two to hash)
 DIR=models/$Q
 mkdir -p $DIR
-for i in 1 2; do
-  f=Qwen3.8-Flash-Next-GSQ-RCO-$Q-0000$i-of-00002.gguf
-  [ -f $DIR/$f.done ] && continue
-  echo "downloading $f ..."
-  curl -fL --retry 20 --retry-all-errors -C - -o $DIR/$f "https://huggingface.co/$REPO/resolve/$REV/$Q/$f"
-  [ $i = 1 ] && want=$SHA1 || want=$SHA2
-  got=$(shasum -a 256 $DIR/$f | cut -d' ' -f1)
-  if [ "$got" != "$want" ]; then
-    echo "$f is damaged (SHA-256 $got); it was deleted - run setup-mac.sh again"; rm -f $DIR/$f; exit 1
+fetch() {   # fetch <path in the repository> <file> <sha256>
+  [ -f $DIR/$2.done ] && return 0
+  echo "downloading $2 ..."
+  curl -fL --retry 20 --retry-all-errors -C - -o $DIR/$2 "https://huggingface.co/$REPO/resolve/$REV/$1"
+  got=$(shasum -a 256 $DIR/$2 | cut -d' ' -f1)
+  if [ "$got" != "$3" ]; then
+    echo "$2 is damaged (SHA-256 $got); it was deleted - run setup-mac.sh again"; rm -f $DIR/$2; exit 1
   fi
-  touch $DIR/$f.done
-done
+  touch $DIR/$2.done
+}
+fetch $Q/Qwen3.8-Flash-Next-GSQ-RCO-$Q-00001-of-00002.gguf Qwen3.8-Flash-Next-GSQ-RCO-$Q-00001-of-00002.gguf $SHA1
+fetch $Q/Qwen3.8-Flash-Next-GSQ-RCO-$Q-00002-of-00002.gguf Qwen3.8-Flash-Next-GSQ-RCO-$Q-00002-of-00002.gguf $SHA2
+MMPROJ=mmproj-Qwen3.8-Flash-Next-BF16.gguf
+fetch $MMPROJ $MMPROJ $SHA_MMPROJ
 MODEL=$DIR/Qwen3.8-Flash-Next-GSQ-RCO-$Q-00001-of-00002.gguf
 
 # 4. the tokenizer and chat template, from the same file (the server's token ids are llama.cpp's)
@@ -74,14 +80,25 @@ if [ ! -f strata-mac.json ]; then
   "engine": "llamacpp",
   "exe": "$LLAMA/build/bin/llama-server",
   "model": "$MODEL",
+  "mmproj": "$DIR/$MMPROJ",
   "max_context": ${STRATA_CONTEXT:-32768},
   "tokenizer": "$DIR/tokenizer",
   "model_name": "qwen3.8-flash-next",
   "log": "strata-mac.log",
-  "port": ${STRATA_PORT:-8080}
+  "port": ${STRATA_PORT:-8080},
+  "args": ["--spec-type", "ngram-simple"]
 }
 EOF
 fi
+# a config written by an earlier setup-mac.sh: images on (delete "mmproj" to turn them off again) and n-gram drafting
+# ("args"; on an M1 Max it made code edits 2.3x faster - 50.7 against 21.8 tok/s - and chat no slower)
+.venv/bin/python -c 'import json, sys
+c = json.load(open("strata-mac.json"))
+n = dict(c)
+n.setdefault("mmproj", sys.argv[1])
+n.setdefault("args", ["--spec-type", "ngram-simple"])
+if n != c:
+    json.dump(n, open("strata-mac.json", "w"), indent=2)' "$DIR/$MMPROJ"
 PORT=$(.venv/bin/python -c 'import json; print(json.load(open("strata-mac.json")).get("port", 8080))')
 cat > run-mac.sh <<EOF
 #!/bin/sh

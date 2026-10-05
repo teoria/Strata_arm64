@@ -73,12 +73,14 @@ Full explanation and every measured number: `docs/DETAILS.md`, `docs/HOW_IT_WORK
 
 ## Apple Silicon (this fork)
 
-The CUDA/HIP engine does not run on macOS. On a Mac, `./setup-mac.sh` builds llama.cpp with Metal (at setup.py's
-`LLAMA_CPP_COMMIT`, into `third_party/llama.cpp`), downloads IQ2_XS into `models/IQ2_XS/`, extracts the tokenizer, and
-writes `strata-mac.json` + `run-mac.sh`. The server then runs `--engine llamacpp`: `LlamaCppEngine` in
+The CUDA/HIP engine does not run on macOS. On a Mac, `./setup-mac.sh` builds llama.cpp with Metal (at its own pin,
+`COMMIT` in the script - newer than setup.py's `LLAMA_CPP_COMMIT` for Metal's sparse attention - into
+`third_party/llama.cpp`), downloads IQ2_XS and its image encoder (`mmproj`) into `models/IQ2_XS/`, extracts the
+tokenizer, and writes `strata-mac.json` (with `"args": ["--spec-type", "ngram-simple"]`: n-gram drafting) + `run-mac.sh`. The server then runs `--engine llamacpp`: `LlamaCppEngine` in
 `serve/server.py` keeps `llama-server` as a child on a free loopback port and sends it token ids over `/completion`
-(`return_tokens`, `cache_prompt`), so templating, parsing, the APIs and the web app stay Strata's. No images, batch
-slots or VRAM reserve on this engine. Tests: `python -m unittest serve.test_llamacpp` (fake server:
+(`return_tokens`, `cache_prompt`), so templating, parsing, the APIs and the web app stay Strata's. Images
+(`LlamaCppVision`): a request with images goes as text plus base64 (`/detokenize`, then `<__media__>` markers;
+`LLAMA_MEDIA_MARKER` pins the marker). No batch slots or VRAM reserve on this engine. Tests: `python -m unittest serve.test_llamacpp` (fake server:
 `serve/llamacpp_fake_server.py`). Use `.venv/bin/python`: macOS's own `python3` is 3.9, too old for the tools.
 
 ## Conventions

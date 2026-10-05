@@ -2,7 +2,7 @@
 
     python serve/llamacpp_fake_server.py --port 8199 [any other llama-server flags, ignored]
 
-GET /health answers {"status": "ok"}.  POST /completion streams the token ids in FAKE_TOKENS (comma-separated, one
+GET /health answers {"status": "ok"}; POST /detokenize decodes serve/server.py's ByteTokenizer ids.  POST /completion streams the token ids in FAKE_TOKENS (comma-separated, one
 SSE chunk each, FAKE_DELAY_S apart) and then the final chunk with stop_type and timings, as llama-server does with
 "stream" and "return_tokens" on: stop_type "limit" when n_predict cut the list short, else FAKE_STOP_TYPE ("eos").
 FAKE_DIE=1 exits in the middle of the first answer.  With FAKE_LOG set, every request body and the command line are
@@ -15,6 +15,9 @@ import os
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+SPECIALS = ["<|im_start|>", "<|im_end|>", "<|endoftext|>", "<|vision_start|>", "<|image_pad|>", "<|vision_end|>"]
 
 
 def log(event: dict):
@@ -36,6 +39,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if self.path == "/detokenize":                   # ByteTokenizer's ids (serve/server.py): bytes, specials >= 256
+            raw = b"".join(SPECIALS[t - 256].encode() if t >= 256 else bytes([t]) for t in body["tokens"])
+            return self._json({"content": raw.decode("utf-8", "replace")})
         log({"body": body})
         tokens = [int(t) for t in os.environ.get("FAKE_TOKENS", "9419,1017,248046").split(",")]
         n = int(body.get("n_predict", len(tokens)))
@@ -53,9 +59,11 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:                              # the client closed the connection: llama-server stops too
                 log({"aborted_after": i})
                 return
+        prompt_n = len(body["prompt"]) - 6 if isinstance(body["prompt"], list) else 100
         self._event({"content": "", "tokens": [], "stop": True, "stop_type": stop_type,
-                     "timings": {"cache_n": 6, "prompt_n": len(body["prompt"]) - 6, "prompt_ms": 120.5,
-                                 "predicted_n": len(tokens), "predicted_ms": 80.25}})
+                     "timings": {"cache_n": 6, "prompt_n": prompt_n, "prompt_ms": 120.5,
+                                 "predicted_n": len(tokens), "predicted_ms": 80.25,
+                                 **({"draft_n": 4, "draft_n_accepted": 3} if os.environ.get("FAKE_DRAFTS") else {})}})
 
     def _event(self, obj):
         self.wfile.write(b"data: " + json.dumps(obj).encode() + b"\n\n")
@@ -74,5 +82,5 @@ if __name__ == "__main__":
     if "--version" in sys.argv:                          # as llama-server prints it (to stderr, after its log line)
         print("version: 0.4.1-dev (build 1, commit 3cf0325)", file=sys.stderr)
         sys.exit(0)
-    log({"argv": sys.argv[1:]})
+    log({"argv": sys.argv[1:], "media_marker": os.environ.get("LLAMA_MEDIA_MARKER")})
     ThreadingHTTPServer(("127.0.0.1", int(sys.argv[sys.argv.index("--port") + 1])), Handler).serve_forever()

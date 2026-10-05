@@ -71,5 +71,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    if "--version" in sys.argv:                          # as llama-server prints it (to stderr, after its log line)
+        print("version: 0.4.1-dev (build 1, commit 3cf0325)", file=sys.stderr)
+        sys.exit(0)
     log({"argv": sys.argv[1:]})
     ThreadingHTTPServer(("127.0.0.1", int(sys.argv[sys.argv.index("--port") + 1])), Handler).serve_forever()

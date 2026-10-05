@@ -1274,10 +1274,21 @@ class LlamaCppEngine:
                  log: str | None = None, env: dict | None = None):
         self.spawn = (exe, model, int(max_context), list(args or []), log, env)
         self.max_context, self.log_path = int(max_context), log
-        self.info = {"version": "llama.cpp"}
+        self.info = {"version": self.version(exe)}
         self.last, self.progress, self.proc, self.log = {}, None, None, None
         self.unloaded = True
         self._start()
+
+    @staticmethod
+    def version(exe: str) -> str:
+        """"llama.cpp 0.4.1-dev (3cf0325)" from `llama-server --version`; the web app's About tab shows it."""
+        try:
+            r = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=30)
+            out = r.stdout + r.stderr
+        except (OSError, subprocess.TimeoutExpired):
+            out = ""
+        m = re.search(r"version: (\S+).*?commit (\w+)", out)
+        return f"llama.cpp {m.group(1)} ({m.group(2)})" if m else "llama.cpp"
 
     def _start(self):
         exe, model, ctx, args, log, env = self.spawn

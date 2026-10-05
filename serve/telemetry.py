@@ -14,6 +14,8 @@ import collections
 import ctypes
 import os
 import platform
+import re
+import subprocess
 import sys
 import threading
 import time
@@ -182,9 +184,45 @@ class _Amd:
         return out
 
 
+class _AppleGpu:
+    """An Apple Silicon GPU's readings from `ioreg` (no sudo), with _Nvml's interface: load ("Device Utilization %")
+    and the memory the GPU has allocated ("Alloc system memory"; unified memory, so out of the Mac's RAM).  No
+    temperature or power: macOS gives those only to `sudo powermetrics`."""
+
+    def __init__(self):
+        self.model, self.cores = None, None
+        out = self._ioreg()
+        m = re.search(r'"model" = "([^"]+)"', out)
+        if m:
+            self.model = m.group(1)
+            c = re.search(r'"gpu-core-count" = (\d+)', out)
+            self.cores = int(c.group(1)) if c else None
+
+    @staticmethod
+    def _ioreg() -> str:
+        try:
+            r = subprocess.run(["ioreg", "-r", "-d", "1", "-c", "IOAccelerator"], capture_output=True, timeout=5)
+            return r.stdout.decode("utf-8", "replace") if r.returncode == 0 else ""
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+
+    def ok(self):
+        return self.model is not None
+
+    def name(self):
+        return f"{self.model} ({self.cores}-core GPU)" if self.cores else self.model
+
+    def read(self):
+        out = self._ioreg()
+        num = lambda key: int(m.group(1)) if (m := re.search(f'"{key}"=(\\d+)', out)) else None   # noqa: E731
+        return {"util": num("Device Utilization %"), "mem_used": num("Alloc system memory")}
+
+
 def gpu_reader(index=0, amd=False):
-    """The card's readings: NVML (NVIDIA), or the amdgpu sysfs files with the AMD backend (#301)."""
-    return _Amd(index) if amd else _Nvml(index)
+    """The card's readings: NVML (NVIDIA), the amdgpu sysfs files with the AMD backend (#301), or ioreg on a Mac."""
+    if amd:
+        return _Amd(index)
+    return _AppleGpu() if sys.platform == "darwin" else _Nvml(index)
 
 
 def free_vram_mib(index=0, amd=False):
@@ -206,6 +244,13 @@ def _cpu_name():
             k = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\CentralProcessor\0")
             return winreg.QueryValueEx(k, "ProcessorNameString")[0].strip()
         except OSError:
+            pass
+    elif sys.platform == "darwin":                       # "Apple M1 Max"; platform.processor() says only "arm"
+        try:
+            r = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, timeout=5)
+            if r.returncode == 0 and r.stdout.strip():
+                return r.stdout.decode("utf-8", "replace").strip()
+        except (OSError, subprocess.TimeoutExpired):
             pass
     elif os.path.exists("/proc/cpuinfo"):
         for line in open("/proc/cpuinfo", encoding="utf-8", errors="replace"):

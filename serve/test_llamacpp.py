@@ -58,6 +58,7 @@ class Engine(Base):
             self.assertEqual(argv[argv.index(flag) + 1], value, flag)
         self.assertIn("--no-webui", argv)
         self.assertEqual(e.max_context, 4096)
+        self.assertEqual(e.info["version"], "llama.cpp 0.4.1-dev (3cf0325)")
 
     def test_streams_ids_and_records_timings(self):
         e = self.engine(FAKE_TOKENS="5,6,248046")
@@ -166,6 +167,43 @@ class Config(unittest.TestCase):
             llamacpp_engine_from_config(cfg, env={"A": "1"})
         cls.assert_called_once_with("/opt/strata/bin/llama-server", "/opt/strata/m.gguf", 8192, args=["--threads", "8"],
                                     log="/tmp/x.log", env={"A": "1"})
+
+
+IOREG = b'''+-o AGXAcceleratorG13X  <class AGXAcceleratorG13X>
+    {
+      "model" = "Apple M1 Max"
+      "gpu-core-count" = 32
+      "PerformanceStatistics" = {"In use system memory"=400179200,"Device Utilization %"=96,"Alloc system memory"=43872518144}
+    }
+'''
+
+
+class AppleTelemetry(unittest.TestCase):
+    """The Mac's GPU and CPU in the web app's About and Monitor tabs (ioreg / sysctl, no sudo)."""
+
+    def run_(self, out):
+        return mock.patch("serve.telemetry.subprocess.run", return_value=mock.Mock(returncode=0, stdout=out))
+
+    def test_gpu_from_ioreg(self):
+        from serve import telemetry
+        with self.run_(IOREG), mock.patch.object(telemetry.sys, "platform", "darwin"):
+            g = telemetry.gpu_reader(0)
+            self.assertTrue(g.ok())
+            self.assertEqual(g.name(), "Apple M1 Max (32-core GPU)")
+            r = g.read()
+        self.assertEqual(r["util"], 96)
+        self.assertEqual(r["mem_used"], 43872518144)
+
+    def test_no_accelerator_is_not_ok(self):
+        from serve import telemetry
+        with self.run_(b""), mock.patch.object(telemetry.sys, "platform", "darwin"):
+            self.assertFalse(telemetry.gpu_reader(0).ok())
+
+    def test_cpu_name_from_sysctl(self):
+        from serve import telemetry
+        with self.run_(b"Apple M1 Max\n"), mock.patch.object(telemetry.sys, "platform", "darwin"), \
+                mock.patch.object(telemetry.os, "name", "posix"):
+            self.assertEqual(telemetry._cpu_name(), "Apple M1 Max")
 
 
 if __name__ == "__main__":
